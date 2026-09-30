@@ -67,6 +67,9 @@ export function createTuiPlugin(module: Core): PluginNamespace.Definition {
       })
       const frames = new Frames(voice)
       const autoPanel = options.panel !== false
+      let preparing = false
+      let generation = 0
+      let disposed = false
 
       const currentSession = () => {
         const route = context.ui.router.current()
@@ -74,24 +77,27 @@ export function createTuiPlugin(module: Core): PluginNamespace.Definition {
       }
 
       // With no session open (e.g. on the home screen), a call starts in a new session.
-      const openNewSession = async (model: CallModel) => {
+      const openNewSession = async (model: CallModel, attempt: number) => {
         try {
           const location = context.location ?? context.data.location.default()
           const created = await context.client.session.create({
             location,
             model,
           })
+          if (attempt !== generation) return undefined
           const previous = context.renderer.currentFocusedEditor
           context.ui.router.navigate({ type: "session", sessionID: created.id })
           // Wait for the new session's prompt to mount and take focus, so opening the panel
           // hands focus back to it rather than to the home screen's (now gone) prompt.
           const ready = () => {
+            if (attempt !== generation) return true
             const editor = context.renderer.currentFocusedEditor
             return currentSession() === created.id && editor && editor !== previous && !editor.isDestroyed
           }
           await waitFor(ready, 2_000)
           return created.id
         } catch (error) {
+          if (attempt !== generation) return undefined
           context.ui.toast.show({
             title: "GPT-Live",
             message: `Could not start a new session: ${error instanceof Error ? error.message : String(error)}`,
@@ -102,15 +108,26 @@ export function createTuiPlugin(module: Core): PluginNamespace.Definition {
       }
 
       const start = async (chosen?: Voice, fresh = false) => {
+        if (disposed || preparing || voice.active) return
+        preparing = true
+        const attempt = ++generation
         try {
           const model = callModel(context)
-          const sessionID = currentSession() ?? (await openNewSession(model))
-          if (!sessionID || currentSession() !== sessionID) return
+          const sessionID = currentSession() ?? (await openNewSession(model, attempt))
+          if (attempt !== generation || !sessionID || currentSession() !== sessionID) return
           if (autoPanel) openPanelKeepingFocus()
           await voice.start(sessionID, model, chosen, fresh)
         } catch (error) {
-          context.ui.toast.show({ title: "GPT-Live", message: describeError(error), variant: "error" })
+          if (attempt === generation)
+            context.ui.toast.show({ title: "GPT-Live", message: describeError(error), variant: "error" })
+        } finally {
+          preparing = false
         }
+      }
+
+      const stop = () => {
+        generation++
+        return voice.stop()
       }
 
       // Close the transcript panel when a call ends normally; keep it open after a failure
@@ -136,10 +153,10 @@ export function createTuiPlugin(module: Core): PluginNamespace.Definition {
         return opened
       }
 
-      const toggle = () => (voice.active ? voice.stop() : start())
+      const toggle = () => (voice.active || preparing ? stop() : start())
 
       const restartWith = async (name: Voice, fresh = false) => {
-        if (voice.active) await voice.stop()
+        if (voice.active || preparing) await stop()
         await start(name, fresh)
       }
 
@@ -187,7 +204,7 @@ export function createTuiPlugin(module: Core): PluginNamespace.Definition {
                   bind: key("stop"),
                   palette: true,
                   slash: { name: "voice-stop", aliases: ["hangup"] },
-                  run: () => voice.stop(),
+                  run: () => stop(),
                 },
                 {
                   id: "gptlive.new",
@@ -284,6 +301,8 @@ export function createTuiPlugin(module: Core): PluginNamespace.Definition {
       }
 
       return async () => {
+        disposed = true
+        generation++
         if (autostart) clearInterval(autostart)
         stopWatchingCall()
         for (const dispose of disposers) dispose()
