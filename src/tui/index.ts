@@ -76,7 +76,16 @@ export function createTuiPlugin(module: Core): PluginNamespace.Definition {
       const openNewSession = async () => {
         try {
           const location = context.location ?? context.data.location.default()
-          const created = await context.client.session.create({ location })
+          const selected = context.ui.model.current()
+          if (!selected) throw new Error("Choose a model before starting a voice call.")
+          const created = await context.client.session.create({
+            location,
+            model: {
+              providerID: selected.providerID,
+              id: selected.modelID,
+              ...(selected.variant ? { variant: selected.variant } : {}),
+            },
+          })
           const previous = context.renderer.currentFocusedEditor
           context.ui.router.navigate({ type: "session", sessionID: created.id })
           // Wait for the new session's prompt to mount and take focus, so opening the panel
