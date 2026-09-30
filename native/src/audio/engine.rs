@@ -37,6 +37,7 @@ const FRAME: usize = 960; // 20 ms at 48 kHz
 const MAX_DECODED: usize = 5760; // 120 ms at 48 kHz
 const MAX_CONCEALED_PACKETS: u16 = 5;
 const LEVEL_INTERVAL: Duration = Duration::from_millis(50);
+const MAX_BLOCKS_PER_SERVICE: usize = 2;
 const SERVICE_INTERVAL: Duration = Duration::from_millis(5);
 
 #[derive(Default)]
@@ -210,6 +211,16 @@ impl State {
         let mut last_levels = Instant::now();
         let mut was_muted = control.muted.load(Ordering::Acquire);
         while !control.stop.load(Ordering::Acquire) {
+            // Service incoming audio before DSP work: a capture backlog must not delay
+            // speech until the transcript (which arrives on another thread) is complete.
+            for _ in 0..32 {
+                let Ok(packet) = incoming.try_recv() else {
+                    break;
+                };
+                self.receive(packet)?;
+            }
+            self.flush_playback(&mut rings.playback);
+
             // Speaker reference first so capture blocks see an up-to-date echo model.
             loop {
                 let read = rings.reference.pop_slice(&mut self.scratch);
@@ -220,7 +231,10 @@ impl State {
             }
             let mut block = [0.0f32; BLOCK];
             let mut processed = [0.0f32; BLOCK];
-            while self.reference.take_exact(&mut block) {
+            for _ in 0..MAX_BLOCKS_PER_SERVICE {
+                if !self.reference.take_exact(&mut block) {
+                    break;
+                }
                 self.apm
                     .process_render_f32(&[&block], &mut [&mut processed])
                     .map_err(|_| anyhow::anyhow!("echo reference processing failed"))?;
@@ -242,7 +256,10 @@ impl State {
             let playback_delay_ms =
                 rings.playback.occupied_len() as f64 * 1000.0 / f64::from(self.output_rate);
             let delay = (playback_delay_ms + 20.0).clamp(0.0, 500.0) as i32;
-            while self.capture.take_exact(&mut block) {
+            for _ in 0..MAX_BLOCKS_PER_SERVICE {
+                if !self.capture.take_exact(&mut block) {
+                    break;
+                }
                 let _ = self.apm.set_stream_delay_ms(delay);
                 self.apm
                     .process_capture_f32(&[&block], &mut [&mut processed])
@@ -264,15 +281,6 @@ impl State {
                 }
             }
 
-            // Playback.
-            while let Ok(packet) = incoming.try_recv() {
-                self.receive(packet)?;
-            }
-            if self.playback.available() > 0 {
-                let samples: Vec<f32> = self.playback.drain_all().collect();
-                rings.playback.push_slice(&samples);
-            }
-
             if last_levels.elapsed() >= LEVEL_INTERVAL {
                 last_levels = Instant::now();
                 emitter.emit(serde_json::json!({
@@ -286,6 +294,15 @@ impl State {
             std::thread::sleep(SERVICE_INTERVAL);
         }
         Ok(())
+    }
+
+    fn flush_playback(&mut self, sink: &mut ringbuf::HeapProd<f32>) {
+        let capacity = sink.vacant_len().min(self.playback.available());
+        if capacity > 0 {
+            let samples: Vec<f32> = self.playback.drain(capacity).collect();
+            let written = sink.push_slice(&samples);
+            debug_assert_eq!(written, samples.len());
+        }
     }
 
     fn receive(&mut self, packet: IncomingPacket) -> anyhow::Result<()> {
@@ -324,5 +341,67 @@ impl State {
     fn play(&mut self, samples: &[f32]) -> anyhow::Result<()> {
         self.speaker.add(samples);
         self.playback.push(samples)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn speaker_backpressure_preserves_every_sample_in_order() {
+        use ringbuf::traits::Split;
+        let mut state = State::new(RATE, RATE).unwrap();
+        let (mut prod, mut cons) = ringbuf::HeapRb::<f32>::new(2).split();
+        state.playback.push(&[1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        state.flush_playback(&mut prod);
+        assert_eq!(state.playback.available(), 3);
+        // A second service while full must not consume queued samples.
+        state.flush_playback(&mut prod);
+        assert_eq!(state.playback.available(), 3);
+        let mut actual = Vec::new();
+        while state.playback.available() > 0 || !cons.is_empty() {
+            while let Some(sample) = cons.try_pop() {
+                actual.push(sample);
+            }
+            state.flush_playback(&mut prod);
+        }
+        assert_eq!(actual, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    }
+
+    // Offline: no microphone, devices, credentials or network. Run explicitly to
+    // check the DSP budget when evaluating a helper build on a target machine.
+    #[test]
+    #[ignore = "manual DSP timing diagnostic"]
+    fn one_second_dsp_budget() {
+        let mut state = State::new(RATE, RATE).unwrap();
+        let input: Vec<f32> = (0..BLOCK)
+            .map(|i| ((i as f32 / RATE as f32) * 440.0 * std::f32::consts::TAU).sin() * 0.1)
+            .collect();
+        let mut processed = [0.0; BLOCK];
+        let mut encoded = [0u8; 1275];
+        let started = Instant::now();
+        for _ in 0..100 {
+            state
+                .apm
+                .process_render_f32(&[&input], &mut [&mut processed])
+                .unwrap();
+            state
+                .apm
+                .process_capture_f32(&[&input], &mut [&mut processed])
+                .unwrap();
+            state.pending.extend_from_slice(&processed);
+            if state.pending.len() >= FRAME {
+                state
+                    .encoder
+                    .encode_float(&state.pending[..FRAME], &mut encoded)
+                    .unwrap();
+                state.pending.drain(..FRAME);
+            }
+        }
+        eprintln!(
+            "DSP processing for 1000 ms of audio: {} ms",
+            started.elapsed().as_millis()
+        );
     }
 }
