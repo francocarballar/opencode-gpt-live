@@ -52,11 +52,11 @@
     "e2e": "bun scripts/e2e-call.ts"
   },
   "dependencies": {
-    "@opencode/plugin": "^2.0.14",
+    "@opencode/plugin": "^2.0.20",
     "zod": "4.1.8"
   },
   "devDependencies": {
-    "@opencode/client": "2.0.14",
+    "@opencode/client": "2.0.20",
     "@opencode/theme": "2.0.14",
     "@opentui/core": "0.5.12",
     "@types/bun": "latest",
@@ -68,6 +68,6 @@
     "@opentui/core": ">=0.5.10"
   },
   "engines": {
-    "opencode": ">=2.0.14"
+    "opencode": ">=2.0.20"
   }
 }
