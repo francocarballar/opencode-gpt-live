@@ -1,7 +1,8 @@
 import type { Plugin as PluginNamespace } from "@opencode/plugin/tui"
 
 import { VOICES, type Voice } from "../shared/rpc"
-import { VoiceController } from "./controller"
+import { VoiceController, describeError } from "./controller"
+import { callModel, type CallModel } from "./model"
 import { Frames, footerBadge, transcriptPanel, useCore, voiceAura, voiceStrip, type Core, type View } from "./ui"
 
 const PANEL = "gptlive.transcript"
@@ -73,18 +74,12 @@ export function createTuiPlugin(module: Core): PluginNamespace.Definition {
       }
 
       // With no session open (e.g. on the home screen), a call starts in a new session.
-      const openNewSession = async () => {
+      const openNewSession = async (model: CallModel) => {
         try {
           const location = context.location ?? context.data.location.default()
-          const selected = context.ui.model.current()
-          if (!selected) throw new Error("Choose a model before starting a voice call.")
           const created = await context.client.session.create({
             location,
-            model: {
-              providerID: selected.providerID,
-              id: selected.modelID,
-              ...(selected.variant ? { variant: selected.variant } : {}),
-            },
+            model,
           })
           const previous = context.renderer.currentFocusedEditor
           context.ui.router.navigate({ type: "session", sessionID: created.id })
@@ -107,10 +102,15 @@ export function createTuiPlugin(module: Core): PluginNamespace.Definition {
       }
 
       const start = async (chosen?: Voice, fresh = false) => {
-        const sessionID = currentSession() ?? (await openNewSession())
-        if (!sessionID) return
-        if (autoPanel) openPanelKeepingFocus()
-        await voice.start(sessionID, chosen, fresh)
+        try {
+          const model = callModel(context)
+          const sessionID = currentSession() ?? (await openNewSession(model))
+          if (!sessionID || currentSession() !== sessionID) return
+          if (autoPanel) openPanelKeepingFocus()
+          await voice.start(sessionID, model, chosen, fresh)
+        } catch (error) {
+          context.ui.toast.show({ title: "GPT-Live", message: describeError(error), variant: "error" })
+        }
       }
 
       // Close the transcript panel when a call ends normally; keep it open after a failure

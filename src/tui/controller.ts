@@ -2,7 +2,7 @@ import type { Plugin } from "@opencode/plugin/tui"
 
 import { GptLive, type TaskStatus, type Voice } from "../shared/rpc"
 import { HelperProcess, ensureHelper, type HelperEvent } from "./helper"
-import { syncCallModel } from "./model"
+import { syncCallModel, type CallModel } from "./model"
 import { arrivalsFor, type Phase } from "./visuals"
 
 type Context = Plugin.Context
@@ -153,7 +153,7 @@ export class VoiceController {
     )
   }
 
-  async start(sessionID: string, voice?: Voice, fresh = false) {
+  async start(sessionID: string, model: CallModel, voice?: Voice, fresh = false) {
     if (this.active || this.starting) return
     this.starting = true
     const session = this.context.data.session.get(sessionID) as { location?: Location } | undefined
@@ -167,7 +167,7 @@ export class VoiceController {
     })
     this.notice("Connecting to GPT-Live…", "info")
     try {
-      await syncCallModel(this.context, sessionID)
+      await syncCallModel(this.context, sessionID, model)
       const binary = await ensureHelper((message) => this.context.ui.toast.show({ message, variant: "info" }))
       const helper = new HelperProcess(binary, {
         onEvent: (event) => this.onHelperEvent(event),
