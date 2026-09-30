@@ -71,6 +71,14 @@ impl Converter {
         self.output.len()
     }
 
+    pub fn clear(&mut self) {
+        self.output.clear();
+        if let Some(inner) = &mut self.inner {
+            inner.input.clear();
+            inner.resampler.reset();
+        }
+    }
+
     /// Takes exactly `out.len()` samples when enough are buffered.
     pub fn take_exact(&mut self, out: &mut [f32]) -> bool {
         if self.output.len() < out.len() {
@@ -108,5 +116,24 @@ mod tests {
         converter.push(&[1.0, 2.0]).unwrap();
         assert_eq!(converter.drain(0).count(), 0);
         assert_eq!(converter.available(), 2);
+    }
+
+    #[test]
+    fn clear_discards_output_partial_input_and_resampler_history() {
+        for rate in [48_000, 44_100] {
+            let mut converter = Converter::new(48_000, rate).unwrap();
+            converter.push(&[1.0; 4_801]).unwrap();
+            assert!(converter.available() > 0);
+            converter.clear();
+            assert_eq!(converter.available(), 0);
+            let mut fresh = Converter::new(48_000, rate).unwrap();
+            let samples = [0.25; 4_800];
+            converter.push(&samples).unwrap();
+            fresh.push(&samples).unwrap();
+            assert_eq!(
+                converter.drain(usize::MAX).collect::<Vec<_>>(),
+                fresh.drain(usize::MAX).collect::<Vec<_>>()
+            );
+        }
     }
 }

@@ -44,11 +44,11 @@ const SERVICE_INTERVAL: Duration = Duration::from_millis(5);
 pub struct EngineControl {
     pub muted: AtomicBool,
     pub stop: AtomicBool,
+    pub clear: AtomicBool,
 }
 
 pub struct Engine {
     pub control: Arc<EngineControl>,
-    playback: Arc<super::io::PlaybackControl>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -67,7 +67,6 @@ impl Engine {
             .take()
             .ok_or_else(|| anyhow::anyhow!("audio already started"))?;
         let state = State::new(io.input.rate, io.output.rate)?;
-        let playback = io.control.clone();
         let thread_control = control.clone();
         let thread = std::thread::Builder::new()
             .name("audio-engine".into())
@@ -89,7 +88,6 @@ impl Engine {
             })?;
         Ok(Self {
             control,
-            playback,
             thread: Some(thread),
         })
     }
@@ -99,7 +97,7 @@ impl Engine {
     }
 
     pub fn clear_output(&self) {
-        self.playback.clear.store(true, Ordering::Release);
+        self.control.clear.store(true, Ordering::Release);
     }
 }
 
@@ -213,13 +211,7 @@ impl State {
         while !control.stop.load(Ordering::Acquire) {
             // Service incoming audio before DSP work: a capture backlog must not delay
             // speech until the transcript (which arrives on another thread) is complete.
-            for _ in 0..32 {
-                let Ok(packet) = incoming.try_recv() else {
-                    break;
-                };
-                self.receive(packet)?;
-            }
-            self.flush_playback(&mut rings.playback);
+            self.service_playback(&mut rings.playback, incoming, control, &io.control)?;
 
             // Speaker reference first so capture blocks see an up-to-date echo model.
             loop {
@@ -296,6 +288,31 @@ impl State {
         Ok(())
     }
 
+    fn service_playback(
+        &mut self,
+        sink: &mut ringbuf::HeapProd<f32>,
+        incoming: &std_mpsc::Receiver<IncomingPacket>,
+        control: &EngineControl,
+        playback: &super::io::PlaybackControl,
+    ) -> anyhow::Result<()> {
+        if control.clear.swap(false, Ordering::AcqRel) {
+            self.playback.clear();
+            playback.clear.store(true, Ordering::Release);
+        }
+        // Leave the producer idle until the renderer acknowledges clearing its ring.
+        if playback.clear.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        for _ in 0..32 {
+            let Ok(packet) = incoming.try_recv() else {
+                break;
+            };
+            self.receive(packet)?;
+        }
+        self.flush_playback(sink);
+        Ok(())
+    }
+
     fn flush_playback(&mut self, sink: &mut ringbuf::HeapProd<f32>) {
         let capacity = sink.vacant_len().min(self.playback.available());
         if capacity > 0 {
@@ -367,6 +384,44 @@ mod tests {
             state.flush_playback(&mut prod);
         }
         assert_eq!(actual, vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn clear_discards_overflow_and_waits_for_the_renderer_before_refilling() {
+        use ringbuf::traits::Split;
+        let mut state = State::new(RATE, RATE).unwrap();
+        let control = EngineControl::default();
+        let playback = Arc::new(super::super::io::PlaybackControl::default());
+        let (mut prod, cons) = ringbuf::HeapRb::<f32>::new(2).split();
+        let (reference, _) = ringbuf::HeapRb::<f32>::new(20).split();
+        let mut renderer = super::super::io::Renderer::new(cons, reference, playback.clone(), 10);
+        let (_tx, incoming) = std_mpsc::channel();
+        state.playback.push(&[1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        state.flush_playback(&mut prod);
+        assert_eq!(state.playback.available(), 3);
+        for _ in 0..2 {
+            control.clear.store(true, Ordering::Release);
+            state
+                .service_playback(&mut prod, &incoming, &control, &playback)
+                .unwrap();
+            assert_eq!(state.playback.available(), 0);
+            assert!(playback.clear.load(Ordering::Acquire));
+        }
+        state.playback.push(&[6.0, 7.0]).unwrap();
+        state
+            .service_playback(&mut prod, &incoming, &control, &playback)
+            .unwrap();
+        assert_eq!(state.playback.available(), 2);
+        let mut out = [0.0; 2];
+        renderer.render(&mut out);
+        assert_eq!(out, [0.0; 2]);
+        assert!(!playback.clear.load(Ordering::Acquire));
+        state
+            .service_playback(&mut prod, &incoming, &control, &playback)
+            .unwrap();
+        renderer.render(&mut out);
+        assert_eq!(out, [6.0, 7.0]);
+        assert_eq!(state.playback.available(), 0);
     }
 
     // Offline: no microphone, devices, credentials or network. Run explicitly to

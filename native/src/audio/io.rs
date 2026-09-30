@@ -314,7 +314,7 @@ where
 }
 
 /// Renders mono speaker samples, handling prebuffering after underruns and clear requests.
-struct Renderer {
+pub(super) struct Renderer {
     playback: HeapCons<f32>,
     reference: HeapProd<f32>,
     control: Arc<PlaybackControl>,
@@ -325,7 +325,7 @@ struct Renderer {
 }
 
 impl Renderer {
-    fn new(
+    pub(super) fn new(
         playback: HeapCons<f32>,
         reference: HeapProd<f32>,
         control: Arc<PlaybackControl>,
@@ -344,11 +344,13 @@ impl Renderer {
         }
     }
 
-    fn render(&mut self, out: &mut [f32]) {
-        if self.control.clear.swap(false, Ordering::AcqRel) {
+    pub(super) fn render(&mut self, out: &mut [f32]) {
+        if self.control.clear.load(Ordering::Acquire) {
             self.playback.clear();
             self.starved = true;
             self.waited = 0;
+            // The engine must not refill the ring until it has been emptied.
+            self.control.clear.store(false, Ordering::Release);
         }
         if self.starved {
             let available = self.playback.occupied_len();
