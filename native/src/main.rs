@@ -204,7 +204,7 @@ impl Session {
                 emitter.emit(serde_json::json!({ "type": "muted", "muted": muted }));
             }
             Command::Clear {} => {
-                // Speaker queue is owned by the output endpoint; the engine forwards the flag.
+                // The engine clears its pending audio before asking the endpoint to clear.
                 if let Some(engine) = &self.engine {
                     engine.clear_output();
                 }
