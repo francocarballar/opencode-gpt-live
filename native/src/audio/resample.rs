@@ -83,7 +83,30 @@ impl Converter {
         true
     }
 
-    pub fn drain_all(&mut self) -> std::collections::vec_deque::Drain<'_, f32> {
-        self.output.drain(..)
+    /// Drain only samples the speaker ring can accept, preserving any overflow.
+    pub fn drain(&mut self, limit: usize) -> std::collections::vec_deque::Drain<'_, f32> {
+        self.output.drain(..limit.min(self.output.len()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Converter;
+
+    #[test]
+    fn partial_playback_drain_preserves_order_and_overflow() {
+        let mut converter = Converter::new(48_000, 48_000).unwrap();
+        converter.push(&[1.0, 2.0, 3.0, 4.0]).unwrap();
+        assert_eq!(converter.drain(2).collect::<Vec<_>>(), vec![1.0, 2.0]);
+        assert_eq!(converter.available(), 2);
+        assert_eq!(converter.drain(8).collect::<Vec<_>>(), vec![3.0, 4.0]);
+    }
+
+    #[test]
+    fn full_speaker_ring_does_not_discard_pending_audio() {
+        let mut converter = Converter::new(48_000, 48_000).unwrap();
+        converter.push(&[1.0, 2.0]).unwrap();
+        assert_eq!(converter.drain(0).count(), 0);
+        assert_eq!(converter.available(), 2);
     }
 }
