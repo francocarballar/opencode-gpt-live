@@ -405,46 +405,6 @@ mod imp {
         })
     }
 
-    #[cfg(test)]
-    mod tests {
-        use super::is_call_stream;
-        use serde_json::json;
-
-        #[test]
-        fn excludes_own_pid() {
-            assert!(is_call_stream(
-                &json!({"properties": {"application.process.id": "42"}}),
-                "42"
-            ));
-        }
-
-        #[test]
-        fn excludes_pipewire_alsa_without_pid() {
-            for properties in [
-                json!({"application.name": "PipeWire ALSA [gpt-live-host]"}),
-                json!({"node.name": "alsa_playback.gpt-live-host"}),
-            ] {
-                assert!(is_call_stream(&json!({"properties": properties}), "42"));
-            }
-        }
-
-        #[test]
-        fn keeps_other_apps_and_prefers_known_pid() {
-            assert!(!is_call_stream(
-                &json!({"properties": {"application.name": "Music"}}),
-                "42"
-            ));
-            assert!(!is_call_stream(
-                &json!({"properties": {
-                    "application.process.id": "99",
-                    "application.name": "PipeWire ALSA [gpt-live-host]"
-                }}),
-                "42"
-            ));
-            assert!(!is_call_stream(&json!({"properties": {}}), "42"));
-        }
-    }
-
     /// Other processes' playback streams as (index, volume in PulseAudio units).
     fn streams() -> anyhow::Result<Vec<(u64, u64)>> {
         let output = Command::new("pactl")
@@ -512,6 +472,45 @@ mod imp {
             }
         }
         Ok(())
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::is_call_stream;
+        use serde_json::json;
+
+        #[test]
+        fn excludes_own_pid() {
+            assert!(is_call_stream(
+                &json!({"properties": {"application.process.id": "42"}}),
+                "42"
+            ));
+        }
+
+        #[test]
+        fn excludes_pipewire_alsa_without_pid() {
+            for properties in [
+                json!({"application.name": "PipeWire ALSA [gpt-live-host]"}),
+                json!({"node.name": "alsa_playback.gpt-live-host"}),
+            ] {
+                assert!(is_call_stream(&json!({"properties": properties}), "42"));
+            }
+        }
+
+        #[test]
+        fn keeps_other_apps_and_prefers_known_pid() {
+            assert!(!is_call_stream(
+                &json!({"properties": {"application.name": "Music"}}),
+                "42"
+            ));
+            assert!(!is_call_stream(
+                &json!({"properties": {
+                    "application.process.id": "99",
+                    "application.name": "PipeWire ALSA [gpt-live-host]"
+                }}),
+                "42"
+            ));
+            assert!(!is_call_stream(&json!({"properties": {}}), "42"));
+        }
     }
 }
 
