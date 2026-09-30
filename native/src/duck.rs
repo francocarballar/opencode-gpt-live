@@ -382,6 +382,69 @@ mod imp {
         set: u64,
     }
 
+    // PipeWire's ALSA bridge can omit application.process.id. In that case the
+    // helper's stable stream names are safer than treating it as another app.
+    fn is_call_stream(stream: &serde_json::Value, own: &str) -> bool {
+        let pid = stream
+            .pointer("/properties/application.process.id")
+            .and_then(|pid| pid.as_str());
+        if let Some(pid) = pid {
+            return pid == own;
+        }
+        [
+            ("application.name", "PipeWire ALSA [gpt-live-host]"),
+            ("node.name", "alsa_playback.gpt-live-host"),
+        ]
+        .iter()
+        .any(|(key, expected)| {
+            stream
+                .get("properties")
+                .and_then(|p| p.get(key))
+                .and_then(|v| v.as_str())
+                == Some(*expected)
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::is_call_stream;
+        use serde_json::json;
+
+        #[test]
+        fn excludes_own_pid() {
+            assert!(is_call_stream(
+                &json!({"properties": {"application.process.id": "42"}}),
+                "42"
+            ));
+        }
+
+        #[test]
+        fn excludes_pipewire_alsa_without_pid() {
+            for properties in [
+                json!({"application.name": "PipeWire ALSA [gpt-live-host]"}),
+                json!({"node.name": "alsa_playback.gpt-live-host"}),
+            ] {
+                assert!(is_call_stream(&json!({"properties": properties}), "42"));
+            }
+        }
+
+        #[test]
+        fn keeps_other_apps_and_prefers_known_pid() {
+            assert!(!is_call_stream(
+                &json!({"properties": {"application.name": "Music"}}),
+                "42"
+            ));
+            assert!(!is_call_stream(
+                &json!({"properties": {
+                    "application.process.id": "99",
+                    "application.name": "PipeWire ALSA [gpt-live-host]"
+                }}),
+                "42"
+            ));
+            assert!(!is_call_stream(&json!({"properties": {}}), "42"));
+        }
+    }
+
     /// Other processes' playback streams as (index, volume in PulseAudio units).
     fn streams() -> anyhow::Result<Vec<(u64, u64)>> {
         let output = Command::new("pactl")
@@ -395,10 +458,7 @@ mod imp {
             .into_iter()
             .flatten()
             .filter_map(|stream| {
-                let pid = stream
-                    .pointer("/properties/application.process.id")
-                    .and_then(|pid| pid.as_str());
-                if pid == Some(own.as_str()) {
+                if is_call_stream(stream, &own) {
                     return None;
                 }
                 let index = stream.get("index")?.as_u64()?;
