@@ -36,6 +36,8 @@ const BLOCK: usize = 480; // 10 ms at 48 kHz
 const FRAME: usize = 960; // 20 ms at 48 kHz
 const MAX_DECODED: usize = 5760; // 120 ms at 48 kHz
 const MAX_CONCEALED_PACKETS: u16 = 5;
+const MAX_PENDING_PLAYBACK_MS: usize = 1_000;
+const CLEAR_ACK_TIMEOUT: Duration = Duration::from_secs(1);
 const LEVEL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_BLOCKS_PER_SERVICE: usize = 2;
 const SERVICE_INTERVAL: Duration = Duration::from_millis(5);
@@ -152,6 +154,7 @@ struct State {
     pending: Vec<f32>,
     expected_sequence: Option<u16>,
     output_rate: u32,
+    clear_started: Option<Instant>,
     mic: Meter,
     speaker: Meter,
     scratch: Vec<f32>,
@@ -184,13 +187,18 @@ impl State {
         Ok(Self {
             capture: Converter::new(input_rate, RATE)?,
             reference: Converter::new(output_rate, RATE)?,
-            playback: Converter::new(RATE, output_rate)?,
+            playback: Converter::new_bounded(
+                RATE,
+                output_rate,
+                (output_rate as usize * MAX_PENDING_PLAYBACK_MS) / 1000,
+            )?,
             apm,
             encoder,
             decoder,
             pending: Vec::with_capacity(FRAME),
             expected_sequence: None,
             output_rate,
+            clear_started: None,
             mic: Meter::new(),
             speaker: Meter::new(),
             scratch: vec![0.0; 8192],
@@ -297,12 +305,22 @@ impl State {
     ) -> anyhow::Result<()> {
         if control.clear.swap(false, Ordering::AcqRel) {
             self.playback.clear();
-            playback.clear.store(true, Ordering::Release);
+            if !playback.clear.swap(true, Ordering::AcqRel) {
+                self.clear_started = Some(Instant::now());
+            }
         }
         // Leave the producer idle until the renderer acknowledges clearing its ring.
         if playback.clear.load(Ordering::Acquire) {
+            if self
+                .clear_started
+                .is_some_and(|started| started.elapsed() >= CLEAR_ACK_TIMEOUT)
+                && playback.clear.load(Ordering::Acquire)
+            {
+                anyhow::bail!("speaker did not acknowledge playback clear within 1 second");
+            }
             return Ok(());
         }
+        self.clear_started = None;
         for _ in 0..32 {
             let Ok(packet) = incoming.try_recv() else {
                 break;
@@ -422,6 +440,38 @@ mod tests {
         renderer.render(&mut out);
         assert_eq!(out, [6.0, 7.0]);
         assert_eq!(state.playback.available(), 0);
+    }
+
+    #[test]
+    fn playback_pending_audio_is_bounded_and_keeps_the_newest_samples() {
+        let mut state = State::new(RATE, RATE).unwrap();
+        let samples: Vec<f32> = (0..RATE as usize + 10)
+            .map(|sample| sample as f32)
+            .collect();
+        state.playback.push(&samples).unwrap();
+        assert_eq!(state.playback.available(), RATE as usize);
+        assert_eq!(state.playback.drain(1).next(), Some(10.0));
+    }
+
+    #[test]
+    fn clear_ack_timeout_fails_instead_of_leaving_audio_silently_stalled() {
+        use ringbuf::traits::Split;
+        let mut state = State::new(RATE, RATE).unwrap();
+        let control = EngineControl::default();
+        let playback = Arc::new(super::super::io::PlaybackControl::default());
+        playback.clear.store(true, Ordering::Release);
+        state.clear_started = Some(Instant::now() - CLEAR_ACK_TIMEOUT - Duration::from_millis(1));
+        let (mut sink, _) = ringbuf::HeapRb::<f32>::new(2).split();
+        let (_tx, incoming) = std_mpsc::channel();
+
+        let error = state
+            .service_playback(&mut sink, &incoming, &control, &playback)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("did not acknowledge playback clear")
+        );
     }
 
     // Offline: no microphone, devices, credentials or network. Run explicitly to
