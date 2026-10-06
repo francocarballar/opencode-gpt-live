@@ -72,7 +72,7 @@ export class VoiceController {
   private readonly listeners = new Set<() => void>()
   private helper: HelperProcess | undefined
   private readonly unsubscribe: Array<() => void> = []
-  private starting = false
+  private starting: number | undefined
   private generation = 0
   private disposed = false
 
@@ -156,10 +156,10 @@ export class VoiceController {
     )
   }
 
-  async start(sessionID: string, model: CallModel, voice?: Voice, fresh = false) {
-    if (this.disposed || this.active || this.starting) return
-    this.starting = true
+  async start(sessionID: string, model: CallModel | undefined, voice?: Voice, fresh = false) {
+    if (this.disposed || this.active || this.starting !== undefined) return
     const generation = ++this.generation
+    this.starting = generation
     const current = () => !this.disposed && this.generation === generation
     const session = this.context.data.session.get(sessionID) as { location?: Location } | undefined
     const location = session?.location ?? this.context.location ?? this.context.data.location.default()
@@ -237,12 +237,12 @@ export class VoiceController {
     } catch (error) {
       if (current()) await this.teardown(describeError(error))
     } finally {
-      this.starting = false
+      if (this.starting === generation) this.starting = undefined
     }
   }
 
   async stop(failure?: string) {
-    this.generation++
+    this.invalidateStart()
     if (!this.active) return
     this.set({ phase: "closing" })
     const { callID, location } = this.state
@@ -255,9 +255,15 @@ export class VoiceController {
 
   private tearingDown = false
 
+  private invalidateStart() {
+    const attempt = this.generation
+    this.generation++
+    if (this.starting === attempt) this.starting = undefined
+  }
+
   private async teardown(failure?: string, reason?: string) {
     if (this.state.phase === "idle" || this.state.phase === "error" || this.tearingDown) return
-    this.generation++
+    this.invalidateStart()
     this.tearingDown = true
     try {
       await this.finishTeardown(failure, reason)

@@ -33,9 +33,10 @@ describe("voice coding-session model", () => {
       { sessionID: "coding-session", model: { providerID: "openai", id: "reasoner", variant: "high" } },
     ])
   })
-  test("does not fall back to another provider when no model is selected", async () => {
+  test("returns no model when the composer has no selection", async () => {
     const { context, calls } = fixture()
-    expect(() => callModel(context)).toThrow("Choose a model")
+    expect(callModel(context)).toBeUndefined()
+    await syncCallModel(context, "coding-session", undefined)
     expect(calls).toEqual([])
   })
   test("awaits persistence and propagates failures before a call can start", async () => {

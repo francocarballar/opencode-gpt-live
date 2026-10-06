@@ -67,7 +67,7 @@ export function createTuiPlugin(module: Core): PluginNamespace.Definition {
       })
       const frames = new Frames(voice)
       const autoPanel = options.panel !== false
-      let preparing = false
+      let preparing: number | undefined
       let generation = 0
       let disposed = false
 
@@ -77,12 +77,12 @@ export function createTuiPlugin(module: Core): PluginNamespace.Definition {
       }
 
       // With no session open (e.g. on the home screen), a call starts in a new session.
-      const openNewSession = async (model: CallModel, attempt: number) => {
+      const openNewSession = async (model: CallModel | undefined, attempt: number) => {
         try {
           const location = context.location ?? context.data.location.default()
           const created = await context.client.session.create({
             location,
-            model,
+            ...(model ? { model } : {}),
           })
           if (attempt !== generation) return undefined
           const previous = context.renderer.currentFocusedEditor
@@ -108,9 +108,9 @@ export function createTuiPlugin(module: Core): PluginNamespace.Definition {
       }
 
       const start = async (chosen?: Voice, fresh = false) => {
-        if (disposed || preparing || voice.active) return
-        preparing = true
+        if (disposed || preparing !== undefined || voice.active) return
         const attempt = ++generation
+        preparing = attempt
         try {
           const model = callModel(context)
           const sessionID = currentSession() ?? (await openNewSession(model, attempt))
@@ -121,12 +121,14 @@ export function createTuiPlugin(module: Core): PluginNamespace.Definition {
           if (attempt === generation)
             context.ui.toast.show({ title: "GPT-Live", message: describeError(error), variant: "error" })
         } finally {
-          preparing = false
+          if (preparing === attempt) preparing = undefined
         }
       }
 
       const stop = () => {
+        const attempt = preparing
         generation++
+        if (preparing === attempt) preparing = undefined
         return voice.stop()
       }
 
@@ -153,10 +155,10 @@ export function createTuiPlugin(module: Core): PluginNamespace.Definition {
         return opened
       }
 
-      const toggle = () => (voice.active || preparing ? stop() : start())
+      const toggle = () => (voice.active || preparing !== undefined ? stop() : start())
 
       const restartWith = async (name: Voice, fresh = false) => {
-        if (voice.active || preparing) await stop()
+        if (voice.active || preparing !== undefined) await stop()
         await start(name, fresh)
       }
 
@@ -303,6 +305,7 @@ export function createTuiPlugin(module: Core): PluginNamespace.Definition {
       return async () => {
         disposed = true
         generation++
+        preparing = undefined
         if (autostart) clearInterval(autostart)
         stopWatchingCall()
         for (const dispose of disposers) dispose()

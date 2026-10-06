@@ -169,22 +169,50 @@ describe("voice model during Home startup", () => {
     expect(f.panel.open).not.toHaveBeenCalled()
   })
 
-  test("reports a missing selection without creating a session or helper", async () => {
+  test("starts with the default model when no selection is available", async () => {
     const f = fixture(true)
     const { run: command } = await plugin(f)
     f.selection.mockReturnValue(undefined)
-    await command("gptlive.toggle")
-    expect(f.toast).toHaveBeenCalledWith({
-      title: "GPT-Live",
-      message: "Choose a model before starting a voice call.",
-      variant: "error",
-    })
-    expect(f.session.create).not.toHaveBeenCalled()
-    expect(f.ensure).not.toHaveBeenCalled()
+    const starting = command("gptlive.toggle")
+    await Promise.resolve()
+    jest.advanceTimersByTime(25)
+    await starting
+    expect(f.session.create).toHaveBeenCalledWith({ location: f.location })
+    expect(f.session.switchModel).not.toHaveBeenCalled()
+    expect(f.ensure).toHaveBeenCalledTimes(1)
+    expect(f.rpc.start).toHaveBeenCalledWith(
+      { sessionID: "created", sdp: "offer", voice: undefined, fresh: false },
+      { location: f.location },
+    )
   })
 })
 
 describe("voice startup cancellation", () => {
+  test("allows a retry before the cancelled model sync settles", async () => {
+    const f = fixture()
+    const reached = deferred<void>()
+    const resume = deferred<void>()
+    let syncs = 0
+    f.session.switchModel.mockImplementation(async () => {
+      syncs++
+      if (syncs === 1) {
+        reached.resolve()
+        await resume.promise
+      }
+    })
+
+    const first = f.controller.start("main", f.model)
+    await reached.promise
+    await f.controller.stop()
+    await f.controller.start("main", f.model)
+    expect(f.controller.state.phase).toBe("live")
+
+    resume.resolve()
+    await first
+    expect(f.controller.state.phase).toBe("live")
+    expect(f.rpc.start).toHaveBeenCalledTimes(1)
+  })
+
   test.each(["model", "binary", "offer", "call", "answer"] as const)(
     "stop invalidates an attempt waiting for %s",
     async (stage) => {
@@ -295,6 +323,37 @@ describe("voice startup cancellation", () => {
 })
 
 describe("Home preparation cancellation", () => {
+  test("voice-new during session creation starts a fresh attempt", async () => {
+    const f = fixture(true)
+    const { run: command } = await plugin(f)
+    const firstCreated = deferred<{ id: string }>()
+    let creates = 0
+    f.session.create.mockImplementation(() => {
+      creates++
+      return creates === 1 ? firstCreated.promise : Promise.resolve({ id: "second" })
+    })
+
+    const first = command("gptlive.toggle")
+    await Promise.resolve()
+    const restart = command("gptlive.new")
+    await Promise.resolve()
+    await Promise.resolve()
+    jest.advanceTimersByTime(25)
+    await restart
+    expect(f.session.create).toHaveBeenCalledTimes(2)
+    expect(f.session.switchModel).toHaveBeenCalledWith({ sessionID: "second", model: f.model })
+    expect(f.rpc.start).toHaveBeenCalledTimes(1)
+    expect(f.rpc.start).toHaveBeenCalledWith(
+      { sessionID: "second", sdp: "offer", voice: "cove", fresh: true },
+      { location: f.location },
+    )
+
+    firstCreated.resolve({ id: "first" })
+    await first
+    expect(f.navigate).toHaveBeenCalledTimes(1)
+    expect(f.navigate).toHaveBeenCalledWith({ type: "session", sessionID: "second" })
+  })
+
   test.each(["stop", "dispose"] as const)("%s during creation prevents late navigation and startup", async (action) => {
     const f = fixture(true)
     const { run: command, dispose } = await plugin(f)
