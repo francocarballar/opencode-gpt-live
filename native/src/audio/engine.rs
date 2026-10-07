@@ -321,11 +321,14 @@ impl State {
             return Ok(());
         }
         self.clear_started = None;
+        // Flush after every packet, so a large batch moves into the speaker ring as it is
+        // decoded instead of overflowing the pending cap while the ring still has room.
         for _ in 0..32 {
             let Ok(packet) = incoming.try_recv() else {
                 break;
             };
             self.receive(packet)?;
+            self.flush_playback(sink);
         }
         self.flush_playback(sink);
         Ok(())
@@ -440,6 +443,32 @@ mod tests {
         renderer.render(&mut out);
         assert_eq!(out, [6.0, 7.0]);
         assert_eq!(state.playback.available(), 0);
+    }
+
+    #[test]
+    fn a_full_batch_of_packets_reaches_the_speaker_ring_without_dropping() {
+        use ringbuf::traits::Observer;
+        use ringbuf::traits::Split;
+        let mut state = State::new(RATE, RATE).unwrap();
+        let control = EngineControl::default();
+        let playback = super::super::io::PlaybackControl::default();
+        let (mut sink, _cons) = ringbuf::HeapRb::<f32>::new(RATE as usize * 4).split();
+        let (tx, incoming) = std_mpsc::channel();
+        let mut encoder =
+            opus::Encoder::new(RATE, opus::Channels::Mono, opus::Application::Voip).unwrap();
+        let packet = vec![0.1f32; FRAME * 2]; // 40 ms
+        for sequence in 0..32u16 {
+            let payload = encoder.encode_vec_float(&packet, 4000).unwrap();
+            tx.send(IncomingPacket { sequence, payload }).unwrap();
+        }
+        state
+            .service_playback(&mut sink, &incoming, &control, &playback)
+            .unwrap();
+        // 32 x 40 ms is more than the 1 s pending cap, but fits the 4 s speaker ring.
+        assert_eq!(
+            sink.occupied_len() + state.playback.available(),
+            32 * packet.len()
+        );
     }
 
     #[test]
